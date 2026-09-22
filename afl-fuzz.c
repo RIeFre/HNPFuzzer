@@ -9395,6 +9395,9 @@ int main(int argc, char** argv) {
         } else if (!strcmp(optarg, "IPP")) {
           extract_requests = &extract_requests_ipp;
           extract_response_codes = &extract_response_codes_ipp;
+        } else if (!strcmp(optarg, "RESP")) {
+          extract_requests = &extract_requests_resp;
+          extract_response_codes = &extract_response_codes_resp;
         } else {
           FATAL("%s protocol is not supported yet!", optarg);
         }

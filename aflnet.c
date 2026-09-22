@@ -798,6 +798,132 @@ region_t* extract_requests_ipp(unsigned char* buf, unsigned int buf_size, unsign
   return regions;
 }
 
+// Parse a CRLF-terminated decimal number (with optional '-') starting at
+// offset, e.g. the "3" of "*3\r\n" or the "-1" of "$-1\r\n". Returns 1 and
+// fills *value and *next_off (the first byte after the CRLF) on success;
+// returns 0 on malformed input or if the line does not fit in the buffer.
+static int read_resp_number(unsigned char* buf, unsigned int buf_size, unsigned int offset, int* value, unsigned int* next_off) {
+  unsigned int i = offset;
+  int sign = 1;
+  long v = 0;
+
+  if (i >= buf_size) return 0;
+  if (buf[i] == '-') {
+    sign = -1;
+    i++;
+  }
+  if (i >= buf_size) return 0;
+  if (!isdigit(buf[i])) return 0;
+
+  while ((i < buf_size) && isdigit(buf[i])) {
+    v = v * 10 + (buf[i] - '0');
+    if (v > 0xFFFFFF) return 0; // sanity cap to keep the arithmetic in range
+    i++;
+  }
+
+  if ((i + 1 >= buf_size) || (buf[i] != 0x0D) || (buf[i + 1] != 0x0A)) return 0;
+
+  *value = (int)(sign * v);
+  *next_off = i + 2;
+  return 1;
+}
+
+// RESP (REdis Serialization Protocol) request splitting. A client command is
+// either a multibulk array ("*N\r\n" followed by N "$len\r\n<data>\r\n" bulk
+// strings) or a plain inline command terminated by CRLF. The whole array (or
+// the whole line) is one request message.
+region_t* extract_requests_resp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  unsigned int byte_count = 0;
+  unsigned int region_count = 0;
+  region_t *regions = NULL;
+
+  while (byte_count < buf_size) {
+    unsigned int start = byte_count;
+    unsigned int end = buf_size - 1;
+    int valid = 0;
+
+    if (buf[byte_count] == '*') {
+      // Multibulk command
+      int count = 0;
+      unsigned int off = 0;
+
+      if (read_resp_number(buf, buf_size, byte_count + 1, &count, &off) && (count >= 0)) {
+        int i;
+        valid = 1;
+        for (i = 0; i < count; i++) {
+          int len = 0;
+          unsigned int data_off = 0;
+
+          if ((off >= buf_size) || (buf[off] != '$')) {
+            valid = 0;
+            break;
+          }
+          if (!read_resp_number(buf, buf_size, off + 1, &len, &data_off)) {
+            valid = 0;
+            break;
+          }
+          if (len < 0) {
+            valid = 0; // null bulk strings cannot appear inside a command
+            break;
+          }
+          if ((unsigned int)len > buf_size - data_off) {
+            valid = 0; // bulk data overruns the buffer
+            break;
+          }
+          off = data_off + len;
+          if ((off + 1 >= buf_size) || (buf[off] != 0x0D) || (buf[off + 1] != 0x0A)) {
+            valid = 0;
+            break;
+          }
+          off += 2;
+        }
+        if (valid) end = off - 1;
+      }
+    } else {
+      // Inline command: everything up to and including the first CRLF
+      unsigned int i;
+      for (i = byte_count; (i + 1) < buf_size; i++) {
+        if ((buf[i] == 0x0D) && (buf[i + 1] == 0x0A)) {
+          end = i + 1;
+          valid = 1;
+          break;
+        }
+      }
+    }
+
+    if (!valid) {
+      // Malformed framing -- the remainder of the buffer becomes one region
+      end = buf_size - 1;
+      byte_count = buf_size;
+    } else {
+      byte_count = end + 1;
+    }
+
+    region_count++;
+    regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
+    regions[region_count - 1].start_byte = start;
+    regions[region_count - 1].end_byte = end;
+    regions[region_count - 1].state_sequence = NULL;
+    regions[region_count - 1].state_count = 0;
+  }
+
+  //in case region_count equals zero, it means that the structure of the buffer is broken
+  //hence we create one region for the whole buffer
+  if ((region_count == 0) && (buf_size > 0)) {
+    regions = (region_t *)ck_realloc(regions, sizeof(region_t));
+    regions[0].start_byte = 0;
+    regions[0].end_byte = buf_size - 1;
+    regions[0].state_sequence = NULL;
+    regions[0].state_count = 0;
+
+    region_count = 1;
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
 unsigned int* extract_response_codes_smtp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
 {
   char *mem;
@@ -1499,6 +1625,135 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
   }
 
   if (mem) ck_free(mem);
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+// Append one mapped response code to the growing state sequence.
+static void resp_append_code(unsigned int code, unsigned int **state_sequence_ref, unsigned int *state_count_ref) {
+  *state_count_ref = *state_count_ref + 1;
+  *state_sequence_ref = (unsigned int *)ck_realloc(*state_sequence_ref, *state_count_ref * sizeof(unsigned int));
+  if (*state_sequence_ref == NULL) PFATAL("Unable to realloc a memory region to store the state sequence");
+  (*state_sequence_ref)[*state_count_ref - 1] = code;
+}
+
+// Walk one RESP reply (possibly a nested array) starting at offset and
+// append a mapped code per reply element. Returns the offset just past the
+// reply, or 0 if the framing is malformed so the caller stops parsing.
+static unsigned int resp_walk_reply(unsigned char* buf, unsigned int buf_size, unsigned int offset, unsigned int depth, unsigned int **state_sequence_ref, unsigned int *state_count_ref) {
+  int number = 0;
+  unsigned int off = offset;
+
+  if (depth > 32) return 0; // nesting sanity cap
+  if (off >= buf_size) return 0;
+
+  switch (buf[off]) {
+    case '+': {
+      // Simple string, e.g. +OK, +PONG, +QUEUED
+      unsigned int i;
+      unsigned int code = 103; // other simple strings
+      for (i = off + 1; i < buf_size; i++) {
+        if (buf[i] == 0x0D) {
+          if ((i + 1 >= buf_size) || (buf[i + 1] != 0x0A)) return 0;
+          if ((i - off == 3) && !memcmp(buf + off + 1, "OK", 2)) code = 100;
+          else if ((i - off == 5) && !memcmp(buf + off + 1, "PONG", 4)) code = 101;
+          else if ((i - off == 7) && !memcmp(buf + off + 1, "QUEUED", 6)) code = 102;
+          resp_append_code(code, state_sequence_ref, state_count_ref);
+          return i + 2;
+        }
+      }
+      return 0; // unterminated line
+    }
+    case '-': {
+      // Error reply, e.g. -ERR, -WRONGTYPE, -NOAUTH, -WRONGPASS, -MOVED.
+      // The code distinguishes the common error keywords.
+      unsigned int i;
+      unsigned int code = 299; // other errors
+      for (i = off + 1; i < buf_size; i++) {
+        if (buf[i] == 0x0D) {
+          unsigned int wlen;
+          unsigned int wend;
+          if ((i + 1 >= buf_size) || (buf[i + 1] != 0x0A)) return 0;
+          // the keyword is the first word only -- error messages usually
+          // carry free text after it (e.g. "-ERR unknown command 'x'")
+          wend = off + 1;
+          while ((wend < i) && (buf[wend] != ' ')) wend++;
+          wlen = wend - (off + 1);
+          if ((wlen == 3) && !memcmp(buf + off + 1, "ERR", 3)) code = 200;
+          else if ((wlen == 9) && !memcmp(buf + off + 1, "WRONGTYPE", 9)) code = 201;
+          else if ((wlen == 6) && !memcmp(buf + off + 1, "NOAUTH", 6)) code = 202;
+          else if ((wlen == 9) && !memcmp(buf + off + 1, "WRONGPASS", 9)) code = 203;
+          else if ((wlen == 5) && !memcmp(buf + off + 1, "MOVED", 5)) code = 204;
+          resp_append_code(code, state_sequence_ref, state_count_ref);
+          return i + 2;
+        }
+      }
+      return 0; // unterminated line
+    }
+    case ':': {
+      // Integer reply -- the value itself is not part of the code
+      if (!read_resp_number(buf, buf_size, off + 1, &number, &off)) return 0;
+      resp_append_code(300, state_sequence_ref, state_count_ref);
+      return off;
+    }
+    case '$': {
+      // Bulk string: "$len\r\n<data>\r\n"; "$-1\r\n" is the null bulk string
+      if (!read_resp_number(buf, buf_size, off + 1, &number, &off)) return 0;
+      if (number == -1) {
+        resp_append_code(401, state_sequence_ref, state_count_ref);
+        return off;
+      }
+      if (number < 0) return 0;
+      if ((unsigned int)number > buf_size - off) return 0; // data overruns the buffer
+      off += number;
+      if ((off + 1 >= buf_size) || (buf[off] != 0x0D) || (buf[off + 1] != 0x0A)) return 0;
+      off += 2;
+      resp_append_code(400, state_sequence_ref, state_count_ref);
+      return off;
+    }
+    case '*': {
+      // Array of replies: "*N\r\n" followed by N replies; "*-1\r\n" is the
+      // null array. The array gets its own code, then each child reply.
+      unsigned int i;
+      if (!read_resp_number(buf, buf_size, off + 1, &number, &off)) return 0;
+      if (number == -1) {
+        resp_append_code(501, state_sequence_ref, state_count_ref);
+        return off;
+      }
+      if (number < 0) return 0;
+      resp_append_code(500, state_sequence_ref, state_count_ref);
+      for (i = 0; i < (unsigned int)number; i++) {
+        off = resp_walk_reply(buf, buf_size, off, depth + 1, state_sequence_ref, state_count_ref);
+        if (off == 0) return 0;
+      }
+      return off;
+    }
+    default:
+      return 0; // unknown reply type -- stop parsing
+  }
+}
+
+// RESP (REdis Serialization Protocol) response-code extraction. Codes:
+//   +OK=100 +PONG=101 +QUEUED=102 other simple strings=103
+//   -ERR=200 -WRONGTYPE=201 -NOAUTH=202 -WRONGPASS=203 -MOVED=204 other errors=299
+//   integer=300  bulk=400 null bulk=401  array=500 null array=501
+unsigned int* extract_response_codes_resp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0;
+  unsigned int offset = 0;
+
+  //Initial state
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  if (state_sequence == NULL) PFATAL("Unable to realloc a memory region to store the state sequence");
+  state_sequence[state_count - 1] = 0;
+
+  while (offset < buf_size) {
+    offset = resp_walk_reply(buf, buf_size, offset, 0, &state_sequence, &state_count);
+    if (offset == 0) break; // malformed reply -- keep what was parsed
+  }
+
   *state_count_ref = state_count;
   return state_sequence;
 }
