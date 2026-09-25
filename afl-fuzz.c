@@ -1884,8 +1884,11 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
     if ((corpus_read_or_sync == 1) && (q->region_count > max_seed_region_count)) max_seed_region_count = q->region_count;
 
   } else {
-    //Convert the linked list kl_messages to regions
-    q->regions = convert_kl_messages_to_regions(kl_messages, &q->region_count, messages_sent);
+    //Convert the linked list kl_messages to regions.
+    //Use the whole list: the regions must tile the complete queue entry,
+    //otherwise construct_kl_messages' sequential read truncates the entry
+    //and every later generation loses the messages after messages_sent.
+    q->regions = convert_kl_messages_to_regions(kl_messages, &q->region_count, kl_messages->size);
   }
 
   /* save the regions' information to file for debugging purpose */
@@ -3896,9 +3899,10 @@ static void perform_dry_run(char** argv) {
     /* Update state-aware variables (e.g., state machine, regions and their annotations */
     if (state_aware_mode) update_state_aware_variables(q, 1);
 
-    /* save the seed to file for replaying */
+    /* save the seed to file for replaying: the complete message list, not
+       just the messages delivered this round (see save_if_interesting) */
     u8 *fn_replay = alloc_printf("%s/replayable-queue/%s", out_dir, basename(q->fname));
-    save_kl_messages_to_file(kl_messages, fn_replay, 1, messages_sent);
+    save_kl_messages_to_file(kl_messages, fn_replay, 1, kl_messages->size);
     ck_free(fn_replay);
 
     /* AFLNet delete the kl_messages */
@@ -4323,7 +4327,15 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
 #endif /* ^!SIMPLE_FILES */
 
-    u32 full_len = save_kl_messages_to_file(kl_messages, fn, 0, messages_sent);
+    /* Save the WHOLE message list, not just the first messages_sent of it.
+       messages_sent only counts the messages the shm handshake managed to
+       deliver this round; on servers whose responses are slow or lost the
+       loop bails after 1-2 messages, and truncating the corpus to that
+       silently discards every mutation of the later messages and shrinks
+       queue entries generation by generation. kl_messages holds the full
+       session test case at this point (prefix + the appended messages
+       parsed from out_buf), which is what a queue entry must contain. */
+    u32 full_len = save_kl_messages_to_file(kl_messages, fn, 0, kl_messages->size);
 
     /* We use the actual length of all messages (full_len), not the len of the mutated message subsequence (len)*/
     add_to_queue(fn, full_len, 0);
@@ -4332,7 +4344,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
     /* save the seed to file for replaying */
     u8 *fn_replay = alloc_printf("%s/replayable-queue/%s", out_dir, basename(queue_top->fname));
-    save_kl_messages_to_file(kl_messages, fn_replay, 1, messages_sent);
+    save_kl_messages_to_file(kl_messages, fn_replay, 1, kl_messages->size);
     ck_free(fn_replay);
 
     if (hnb == 2) {
@@ -4476,9 +4488,10 @@ keep_as_crash:
   }
 
   /* If we're here, we apparently want to save the crash or hang
-     test case, too. */
+     test case, too. Save the whole list: a truncated crash input
+     cannot reproduce the crash (see save_if_interesting). */
 
-  save_kl_messages_to_file(kl_messages, fn, 1, messages_sent);
+  save_kl_messages_to_file(kl_messages, fn, 1, kl_messages->size);
 
   /*fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
   if (fd < 0) PFATAL("Unable to create '%s'", fn);
