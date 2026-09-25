@@ -371,6 +371,53 @@ static int get_line_end(const void *buf,int size){
   return line_end-buf;
 }
 
+/* Honor MSG_PEEK in recv(). ippserver's first-time TLS probe does
+   recv(fd, buf, 1, MSG_PEEK) before reading the request; the interposition
+   ignored the flag and consumed the byte, so every request arrived with
+   its first byte missing ("OST /ipp/print..." instead of "POST..."), the
+   server answered 400 Bad Request and closed the connection after that
+   one broken exchange (is_end=6) -- only the first message of a test
+   case was ever delivered. shm_peek waits for data like a blocking recv
+   but copies without consuming. */
+static int shm_peek(int fd,char *buf,size_t size){
+  int result=0,avail;
+  sigset_t sigset;
+
+  thread_block_signal(&sigset);
+  lock(&session_msg->mx);
+  reset_loop_cnt();
+
+  while(1){
+    if(atomic_load(connection_state)==ENDING || session_msg->is_end){
+      unlock(&session_msg->mx);
+      thread_unblock_signal(&sigset);
+      return session_end();
+    }
+
+    if(session_msg->buf_size>0){
+      avail = size<session_msg->buf_size?(int)size:session_msg->buf_size;
+      memcpy(buf,session_msg->data1+read_p,avail);
+      result=avail;
+      break;
+    }
+
+    /* Nothing buffered: hand the turn to the client and wait for data,
+       the same notify/wait pair the len1==0 branch of shm_read uses. */
+    shm_notify(&session_msg->state,CLIENT);
+    unlock(&session_msg->mx);
+    thread_unblock_signal(&sigset);
+
+    shm_wait(&session_msg->state,CLIENT,-1);
+
+    thread_block_signal(&sigset);
+    lock(&session_msg->mx);
+  }
+
+  unlock(&session_msg->mx);
+  thread_unblock_signal(&sigset);
+  return result;
+}
+
 static int shm_read(int fd,char *buf,size_t size,int read_line){
   int result=0,line_end,buf_size;
   sigset_t sigset;
@@ -1226,8 +1273,13 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
     original_recv=dlsym(RTLD_NEXT, "recv");
   
   if(!disable_shm && check_fd(sockfd,SESSION_FD)){
-    shm_write(1);
-    while(!(ret_val=shm_read(sockfd,buf,len,0)));
+    if(flags & MSG_PEEK){
+      ret_val=shm_peek(sockfd,buf,len);
+    }
+    else{
+      shm_write(1);
+      while(!(ret_val=shm_read(sockfd,buf,len,0)));
+    }
   }
   else{
     if(!disable_shmsync && check_fd(sockfd,SESSION_FD))
