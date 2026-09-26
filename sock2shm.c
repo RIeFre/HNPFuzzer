@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <time.h>
 #include <linux/kcmp.h>
 #include <arpa/inet.h>
 
@@ -918,6 +919,58 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
     if(__log_fd && original_fprintf)
       DO_LOG("poll:%d %d %d %d\n",session_i,server_i,ret_val,tmp);
   #endif
+
+  return ret_val;
+}
+
+// OpenSSH >= 8.x waits for the next packet with ppoll() instead of poll()/
+// select(). sock2shm did not interpose it, so the wait hit the real session
+// socket -- where the fuzzer never writes (it writes requests into shm) --
+// and the server blocked forever right after its first reply while its
+// pending responses sat in send_buf unflushed (the flush happens on the
+// server's next read()). Same fake-ready trick as poll().
+int (*original_ppoll)(struct pollfd *fds, nfds_t nfds, const struct timespec *tmo_p, const sigset_t *sigmask)=NULL;
+
+int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *tmo_p, const sigset_t *sigmask){
+  int i,session_i=-1,server_i=-1,ret_val=0,tmp,tmp_session_fd=-1;
+  struct timespec zero_ts={0,0};
+
+  if(!original_ppoll)
+    original_ppoll=dlsym(RTLD_NEXT,"ppoll");
+
+  for(i=0;i<nfds;i++){
+    if(check_fd(fds[i].fd,SESSION_FD)){
+      ret_val++;
+      session_i=i;
+      tmp_session_fd=fds[i].fd;
+    }
+    else if(check_fd(fds[i].fd,SERVER_FD)){
+      server_i=i;
+    }
+  }
+
+  if((session_msg->is_end || session_i<0) && server_i>=0){
+      shm_wait(connection_state,RUNNING,-1);
+      if(__sync_bool_compare_and_swap(connection_state,ENDING,UNINITIALIZED)){
+        check_global_state();
+        suspend();
+      }
+  }
+
+  if(!disable_shmsync && session_i>=0 && poll_loop_cnt<MAX_LOOP){
+    tmp=original_ppoll(fds,nfds,&zero_ts,sigmask);
+    fds[session_i].fd=tmp_session_fd; // poll may modify the fd
+    fds[session_i].revents=POLLIN | POLLOUT;
+    poll_loop_cnt++;
+    atomic_store(&has_recv_msg,0);
+  }
+  else
+    tmp=original_ppoll(fds,nfds,tmo_p,sigmask);
+
+  if(tmp>=0 && poll_loop_cnt<MAX_LOOP)
+    ret_val+=tmp;
+  else
+    ret_val=tmp;
 
   return ret_val;
 }
