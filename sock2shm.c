@@ -975,12 +975,69 @@ int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *tmo_p, const s
   return ret_val;
 }
 
+// Consumers read the epoll event payload back in their own convention: knotd
+// registers .data.u64 = <index into its own fd array> and uses that index on
+// every event epoll_wait returns; kamailio and most servers read .data.fd.
+// The fabricated session event in epoll_wait() used to hardcode
+// .data.fd = session_fd, so knotd indexed its 2-3 entry array with the raw
+// fd number and read out of bounds ("heap-buffer-overflow READ of size 4" in
+// fdset_it_get_fd, fdset.h). Remember the payload the caller itself passed
+// to epoll_ctl() for the session fd, per epoll set, and replay it in the
+// fabricated event.
+#define MAX_EPOLL_SETS 64
+static struct { int epfd; epoll_data_t data; int used; } session_payload[MAX_EPOLL_SETS];
+static pthread_mutex_t session_payload_mx = PTHREAD_MUTEX_INITIALIZER;
+
+static void session_payload_save(int epfd, epoll_data_t data){
+  int i, free_i=-1;
+  pthread_mutex_lock(&session_payload_mx);
+  for(i=0;i<MAX_EPOLL_SETS;i++){
+    if(session_payload[i].used && session_payload[i].epfd==epfd){
+      session_payload[i].data=data;
+      pthread_mutex_unlock(&session_payload_mx);
+      return;
+    }
+    if(!session_payload[i].used && free_i<0)
+      free_i=i;
+  }
+  if(free_i>=0){
+    session_payload[free_i].used=1;
+    session_payload[free_i].epfd=epfd;
+    session_payload[free_i].data=data;
+  } // table full: this set falls back to the legacy .fd behavior
+  pthread_mutex_unlock(&session_payload_mx);
+}
+
+static int session_payload_get(int epfd, epoll_data_t *out){
+  int i, found=0;
+  pthread_mutex_lock(&session_payload_mx);
+  for(i=0;i<MAX_EPOLL_SETS;i++)
+    if(session_payload[i].used && session_payload[i].epfd==epfd){
+      *out=session_payload[i].data;
+      found=1;
+      break;
+    }
+  pthread_mutex_unlock(&session_payload_mx);
+  return found;
+}
+
+static void session_payload_del(int epfd){
+  int i;
+  pthread_mutex_lock(&session_payload_mx);
+  for(i=0;i<MAX_EPOLL_SETS;i++)
+    if(session_payload[i].used && session_payload[i].epfd==epfd)
+      session_payload[i].used=0;
+  pthread_mutex_unlock(&session_payload_mx);
+}
+
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event){
-  
+
   if(op==EPOLL_CTL_ADD){
     if(check_fd(fd,SESSION_FD)){
       epoll_session_fd=epfd;
       fd_map[epfd]|=E_SESSION_FD;
+      if(event)
+        session_payload_save(epfd,event->data);
     }
     else if(check_fd(fd,SERVER_FD)){
       epoll_server_fd=epfd;
@@ -992,12 +1049,17 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event){
       //epoll_session_fd=-402;
       epoll_session_fd=next_dup_fd(E_SESSION_FD);
       fd_map[epfd]&=~E_SESSION_FD;
+      session_payload_del(epfd);
     }
     else if(check_fd(fd,SERVER_FD)){
       //epoll_server_fd=-401;
       epoll_server_fd=next_dup_fd(E_SERVER_FD);
       fd_map[epfd]&=~E_SERVER_FD;
     }
+  }
+  else if(op==EPOLL_CTL_MOD){
+    if(check_fd(fd,SESSION_FD) && event)
+      session_payload_save(epfd,event->data);
   }
   
   if(!original_epoll_ctl)
@@ -1015,7 +1077,10 @@ int epoll_wait(int epfd, struct epoll_event *events, // Really naive implementat
     if(disable_shmsync)
       return original_epoll_wait(epfd,events,maxevents,timeout);
     event.events = EPOLLOUT | EPOLLIN; //epoll_event_op;
-    event.data.fd = session_fd;
+    // Replay the caller's own epoll_ctl payload (u64 index, fd, ptr...);
+    // only fall back to the fd when none was captured.
+    if(!session_payload_get(epfd,&event.data))
+      event.data.fd = session_fd;
     *events=event;
     epoll_loop_cnt++;
     atomic_store(&has_recv_msg,0);
@@ -1319,6 +1384,29 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags){
   return ret_val;
 }
 
+// Same rationale as recvmmsg(): knot-dns's UDP handler batches its replies
+// with sendmmsg() (udp-handler.c), which was not interposed -- replies went
+// to the real socket nobody reads and the fuzzer saw empty responses. Push
+// msgvec[0] into the shm response buffer, one message per call.
+int (*original_sendmmsg)(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)=NULL;
+
+int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags){
+  int i,ret_val;
+
+  if(!original_sendmmsg)
+    original_sendmmsg=dlsym(RTLD_NEXT,"sendmmsg");
+
+  if(!disable_shm && check_fd(sockfd,SESSION_FD) && vlen>0){
+    for(i=0,ret_val=0;i<msgvec[0].msg_hdr.msg_iovlen;i++){
+      ret_val+=shm_write_buf(msgvec[0].msg_hdr.msg_iov[i].iov_base,msgvec[0].msg_hdr.msg_iov[i].iov_len);
+    }
+    msgvec[0].msg_len=ret_val;
+    return 1;
+  }
+
+  return original_sendmmsg(sockfd,msgvec,vlen,flags);
+}
+
 ssize_t recv(int sockfd, void *buf, size_t len, int flags){
   int ret_val=0;
   
@@ -1393,6 +1481,46 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags){
   }
 
   return ret_val;
+}
+
+// knot-dns's UDP handler receives with recvmmsg() (udp-handler.c), which was
+// not interposed: the real call hit the real socket where the fuzzer never
+// writes, returned EAGAIN (MSG_DONTWAIT) every time, and once the epoll
+// fake-ready budget (MAX_LOOP) ran out the worker blocked in the real
+// epoll_wait -- the fuzzer's requests sat in shm unconsumed until -t killed
+// the exec. Deliver one shm message into msgvec[0] (knot uses a single
+// KNOT_WIRE_MAX_PKTSIZE iov per message), mirroring recvmsg's flush-then-
+// block handshake, and fill the same synthetic source metadata as the
+// recvfrom/recvmsg paths so msg_name/cmsg inspectors read defined values.
+int (*original_recvmmsg)(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, struct timespec *timeout)=NULL;
+
+int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, struct timespec *timeout){
+  int tmp;
+
+  if(!original_recvmmsg)
+    original_recvmmsg=dlsym(RTLD_NEXT,"recvmmsg");
+
+  if(!disable_shm && check_fd(sockfd,SESSION_FD) && vlen>0 && msgvec[0].msg_hdr.msg_iovlen>0){
+    shm_write(1); // flush pending responses first, like recvfrom/recvmsg
+    do{
+      tmp=shm_read(sockfd,msgvec[0].msg_hdr.msg_iov[0].iov_base,msgvec[0].msg_hdr.msg_iov[0].iov_len,0);
+      if(tmp<0)
+        return -1;
+    }while(tmp==0);
+    msgvec[0].msg_len=tmp;
+    if(msgvec[0].msg_hdr.msg_name){
+      ((struct sockaddr_in*)msgvec[0].msg_hdr.msg_name)->sin_family=AF_INET;
+      ((struct sockaddr_in*)msgvec[0].msg_hdr.msg_name)->sin_port=0x8383;
+      ((struct sockaddr_in*)msgvec[0].msg_hdr.msg_name)->sin_addr.s_addr=0x100007f;
+      msgvec[0].msg_hdr.msg_namelen=sizeof(struct sockaddr_in);
+    }
+    if(msgvec[0].msg_hdr.msg_control)
+      msgvec[0].msg_hdr.msg_controllen=0;
+    msgvec[0].msg_hdr.msg_flags=0;
+    return 1;
+  }
+
+  return original_recvmmsg(sockfd,msgvec,vlen,flags,timeout);
 }
 
 ssize_t read(int fd, void * buf, size_t count) {
