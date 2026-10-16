@@ -381,8 +381,7 @@ u32 state_ids_count = 0;
 u32 selected_state_index = 0;
 u32 state_cycles = 0;
 u32 messages_sent = 0;
-u64 messages_sent_total = 0, last_messages_sent_total = 0;
-double avg_msg_sent;
+double avg_cases;
 EXP_ST u8 session_virgin_bits[MAP_SIZE];     /* Regions yet untouched while the SUT is still running */
 EXP_ST u8 *cleanup_script; /* script to clean up the environment of the SUT -- make fuzzing more deterministic */
 EXP_ST u8 *netns_name; /* network namespace name to run server in */
@@ -3614,7 +3613,6 @@ static u8 run_target(char** argv, u32 timeout) {
   setitimer(ITIMER_REAL, &it, NULL);
 
   total_execs++;
-  messages_sent_total+=messages_sent;
 
   /* Any subsequent operations on trace_bits must not be moved by the
      compiler below this point. Past this location, trace_bits[] behave
@@ -4626,8 +4624,8 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
              "target_mode       : %s%s%s%s%s%s%s\n"
              "command_line      : %s\n"
              "slowest_exec_ms   : %llu\n"
-             "msgs_per_sec      : %0.02f\n"
-             "total_msg_sent    : %lld\n",
+             "cases_per_sec     : %0.02f\n"
+             "total_cases       : %lld\n",
              start_time / 1000, get_cur_time() / 1000, getpid(),
              queue_cycle ? (queue_cycle - 1) : 0, total_execs, eps,
              queued_paths, queued_favored, queued_discovered, queued_imported,
@@ -4641,7 +4639,7 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
              persistent_mode ? "persistent " : "", deferred_mode ? "deferred " : "",
              (qemu_mode || dumb_mode || no_forkserver || crash_mode ||
               persistent_mode || deferred_mode) ? "" : "default",
-             orig_cmdline, slowest_exec_ms,(messages_sent_total*1000.0)/(get_cur_time()-start_time),messages_sent_total);
+             orig_cmdline, slowest_exec_ms,(total_execs*1000.0)/(get_cur_time()-start_time),total_execs);
              /* ignore errors */
 
   /* Get rss value from the children
@@ -4695,7 +4693,7 @@ static void maybe_update_plot_file(double bitmap_cvg, double eps) {
           "%llu, %llu, %u, %u, %u, %u, %0.02f%%, %llu, %llu, %u, %0.02f, %0.02f\n",
           get_cur_time() / 1000, queue_cycle - 1, current_entry, queued_paths,
           pending_not_fuzzed, pending_favored, bitmap_cvg, unique_crashes,
-          unique_hangs, max_depth, eps, avg_msg_sent); /* ignore errors */
+          unique_hangs, max_depth, eps, avg_cases); /* ignore errors */
 
   fflush(plot_file);
 
@@ -5145,8 +5143,7 @@ static void show_stats(void) {
 
   }
 
-  avg_msg_sent =(double)((messages_sent_total-last_messages_sent_total)*1000.0)/(cur_ms-last_ms);
-  last_messages_sent_total=messages_sent_total;
+  avg_cases =(double)((total_execs-last_execs)*1000.0)/(cur_ms-last_ms);
 
   last_ms = cur_ms;
   last_execs = total_execs;
@@ -5419,8 +5416,8 @@ static void show_stats(void) {
 
   SAYF (bSTG bV bSTOP "  total tmouts : " cRST "%-22s " bSTG bV "\n", tmp);
 
-  sprintf(tmp, "%-.2f msg/sec", avg_msg_sent);
-  SAYF(bV bSTOP "   msg speed : " "%s" "%-21s " bSTG bV bSTOP "%-40s" bSTG bV "\n", avg_msg_sent>avg_exec*10?cLGN:cRST, tmp, "");
+  sprintf(tmp, "%-.2f cases/sec", avg_cases);
+  SAYF(bV bSTOP " case speed : " "%s" "%-21s " bSTG bV bSTOP "%-40s" bSTG bV "\n", avg_cases>avg_exec?cLGN:cRST, tmp, "");
 
   /* Aaaalmost there... hold on! */
 
@@ -8584,7 +8581,7 @@ EXP_ST void setup_dirs_fds(void) {
 
   fprintf(plot_file, "# unix_time, cycles_done, cur_path, paths_total, "
                      "pending_total, pending_favs, map_size, unique_crashes, "
-                     "unique_hangs, max_depth, execs_per_sec, msgs_per_sec\n");
+                     "unique_hangs, max_depth, execs_per_sec, cases_per_sec\n");
                      /* ignore errors */
 
 }
