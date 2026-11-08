@@ -383,6 +383,20 @@ u32 state_cycles = 0;
 u32 messages_sent = 0;
 u64 messages_sent_total = 0, last_messages_sent_total = 0;
 double avg_msg_sent;
+
+/* Replay-only audit (hnp-replay delivery parity): HNPFUZZER_REPLAY_ONLY=1
+   delivers every queue entry once through the exact shm delivery path and
+   stops after the dry run.  HNPFUZZER_REPLAYABLE_DIR supplies each entry's
+   fuzzing-time message boundaries (the campaign's replayable-queue twin),
+   so delivery is not re-split by the protocol parser.  messages_delivered
+   counts only writes whose final chunk barrier completed -- the same
+   completion criterion as hnp-replay. */
+u32 messages_delivered = 0;
+u32 replay_depth_min = 0;
+u8  replay_depth_seen = 0;
+u8  replay_only = 0;
+u8* replayable_dir = NULL;
+u64 replay_twins_parsed = 0;
 EXP_ST u8 session_virgin_bits[MAP_SIZE];     /* Regions yet untouched while the SUT is still running */
 EXP_ST u8 *cleanup_script; /* script to clean up the environment of the SUT -- make fuzzing more deterministic */
 EXP_ST u8 *netns_name; /* network namespace name to run server in */
@@ -1176,6 +1190,7 @@ int send_over_network()
   //write the request messages
   kliter_t(lms) *it;
   messages_sent = 0;
+  messages_delivered = 0;
 
   for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
     n = net_send(sockfd, timeout, kl_val(it)->mdata, kl_val(it)->msize, disable_shmsync);
@@ -1299,11 +1314,13 @@ int send_over_shm()
   //write the request messages
   kliter_t(lms) *it;
   messages_sent = 0;
+  messages_delivered = 0;
 
   for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
     *is_M2 = *is_M2 || messages_sent==M2_start_region_ID;
     n = shm_write(sockfd, kl_val(it)->mdata, kl_val(it)->msize);
     messages_sent++;
+    if (n == (int)kl_val(it)->msize) messages_delivered++;
 
     //Allocate memory to store new accumulated response buffer size
     response_bytes = (u32 *) ck_realloc(response_bytes, messages_sent * sizeof(u32));
@@ -1371,6 +1388,13 @@ int send_over_shm()
       int status = kill(child_pid, 0);
       if ((status != 0) && (errno == ESRCH)) break;
     }
+  }
+  if (replay_only) {
+    /* Delivery-parity evidence: strict count, minimum across calibration
+       passes as the conservative fuzzing-side depth. */
+    if (!replay_depth_seen || messages_delivered < replay_depth_min)
+      replay_depth_min = messages_delivered;
+    replay_depth_seen = 1;
   }
   return 0;
 }
@@ -3862,11 +3886,61 @@ static void check_map_coverage(void) {
 /* Perform dry run of all test cases to confirm that the app is working as
    expected. This is done only for the initial inputs, and only once. */
 
+/* Load the structured replayable twin ([u32 len][payload] per message, as
+   written by save_kl_messages_to_file with replay_enabled=1): the exact
+   message list and boundaries the campaign delivered. */
+/* The audit runs a previous campaign's queue as -i, so AFL renames every
+   entry to id:NNNNNN,orig:<campaign name>.  The campaign's twins and the
+   collector's depth lookups use the original queue name; recover it. */
+static u8* replay_queue_name(u8* fn) {
+
+  u8* orig = (u8*)strstr((char*)fn, ",orig:");
+  return orig ? orig + 6 : fn;
+
+}
+
+static klist_t(lms) *load_kl_messages_from_twin(u8* fname) {
+
+  FILE* file = fopen((char*)fname, "rb");
+  if (!file) FATAL("Replay audit twin missing: '%s'", fname);
+
+  klist_t(lms) *kl_messages = kl_init(lms);
+  u32 len;
+
+  while (fread(&len, sizeof(len), 1, file) == 1) {
+
+    if (!len) FATAL("Zero-length message in replay twin '%s'", fname);
+
+    message_t *m = (message_t *)ck_alloc(sizeof(message_t));
+    m->mdata = (char *)ck_alloc(len);
+    m->msize = len;
+    if (fread(m->mdata, 1, len, file) != len)
+      FATAL("Truncated message in replay twin '%s'", fname);
+    *kl_pushp(lms, kl_messages) = m;
+
+  }
+
+  if (!kl_messages->size) FATAL("Empty replay twin '%s'", fname);
+  fclose(file);
+  return kl_messages;
+
+}
+
 static void perform_dry_run(char** argv) {
 
   struct queue_entry* q = queue;
   u32 cal_failures = 0;
   u8* skip_crashes = getenv("AFL_SKIP_CRASHES");
+  FILE *depths = NULL;
+
+  if (replay_only) {
+
+    u8* depths_path = alloc_printf("%s/fuzz-depths.tsv", out_dir);
+    depths = fopen((char*)depths_path, "w");
+    if (!depths) PFATAL("Unable to create '%s'", depths_path);
+    ck_free(depths_path);
+
+  }
 
   while (q) {
 
@@ -3891,9 +3965,36 @@ static void perform_dry_run(char** argv) {
     close(fd);
 
     /* AFLNet construct the kl_messages linked list for this queue entry*/
-    kl_messages = construct_kl_messages(q->fname, q->regions, q->region_count);
+    if (replay_only) {
 
+      /* The audit must deliver the campaign's own message list -- the one
+         the coverage driver replays -- not a parser re-split of the flat
+         queue file. */
+      u8* twin = alloc_printf("%s/%s", replayable_dir, replay_queue_name(fn));
+      kl_messages = load_kl_messages_from_twin(twin);
+      replay_twins_parsed++;
+      ck_free(twin);
+
+    } else
+
+      kl_messages = construct_kl_messages(q->fname, q->regions, q->region_count);
+
+    replay_depth_seen = 0;
+    replay_depth_min = 0;
     res = calibrate_case(argv, q, use_mem, 0, 1);
+
+    if (depths) {
+
+      u8* audit_name = replay_queue_name(fn);
+      if (strchr((char*)audit_name, '\t') || strchr((char*)audit_name, '\n'))
+        FATAL("Replay audit input name cannot contain tabs or newlines");
+      if (fprintf(depths, "%s\t%d\n", audit_name,
+                  replay_depth_seen ? (s32)replay_depth_min : -1) < 0 ||
+          fflush(depths))
+        PFATAL("Unable to write replay depth evidence");
+
+    }
+
     ck_free(use_mem);
 
     /* Update state-aware variables (e.g., state machine, regions and their annotations */
@@ -3925,6 +4026,21 @@ static void perform_dry_run(char** argv) {
         break;
 
       case FAULT_TMOUT:
+
+        if (replay_only) {
+
+          /* A fresh-context timeout is an evidence limit, not a seed defect
+             (the campaign ran this input under the forkserver's warm
+             context).  The depth row already records it as incomplete; the
+             coverage collector excludes such inputs from the parity
+             denominator.  No cal_failed retry: a re-audited input would
+             append a second depth row. */
+          WARNF("Test case '%s' timed out in the fresh audit context "
+                "(tolerated; depth recorded incomplete)", fn);
+          cal_failures++;
+          break;
+
+        }
 
         if (timeout_given) {
 
@@ -4671,6 +4787,10 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
     fprintf(f, "peak_rss_mb       : %zu\n", usage.ru_maxrss >> 10);
 #endif /* ^__APPLE__ */
   }
+
+  if (replay_only)
+    fprintf(f, "replay_only       : 1\n"
+               "replay_twins_parsed : %llu\n", replay_twins_parsed);
 
   fclose(f);
 
@@ -9587,7 +9707,38 @@ int main(int argc, char** argv) {
   else
     use_argv = argv + optind;
 
+  /* Replay-only audit (hnp-replay delivery parity): deliver every queue
+     entry once through the shm path with the campaign's saved boundaries,
+     then stop -- no mutation, no state inference. */
+  {
+
+    u8* replay_env = (u8*)getenv("HNPFUZZER_REPLAY_ONLY");
+    if (replay_env && (!strcmp((char*)replay_env, "0") ||
+                       !strcmp((char*)replay_env, "1")))
+      replay_only = atoi((char*)replay_env);
+    else if (replay_env)
+      FATAL("Invalid HNPFUZZER_REPLAY_ONLY '%s' (expected 0 or 1)", replay_env);
+
+    if (replay_only) {
+
+      replayable_dir = (u8*)getenv("HNPFUZZER_REPLAYABLE_DIR");
+      if (!replayable_dir)
+        FATAL("HNPFUZZER_REPLAY_ONLY requires HNPFUZZER_REPLAYABLE_DIR");
+
+    }
+
+  }
+
   perform_dry_run(use_argv);
+
+  if (replay_only) {
+
+    OKF("Replay-only audit finished: %llu twins parsed",
+        replay_twins_parsed);
+    write_stats_file(0, 0, 0);
+    exit(0);
+
+  }
 
   cull_queue();
 
