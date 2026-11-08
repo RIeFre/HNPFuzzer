@@ -25,7 +25,7 @@ CONTAINER_PATH = ./llvm_mode/containers.a
 
 # PROGS intentionally omit afl-as, which gets installed elsewhere.
 
-PROGS       = afl-gcc afl-fuzz afl-replay aflnet-replay afl-showmap afl-tmin afl-gotcpu afl-analyze replay-crashes
+PROGS       = afl-gcc afl-fuzz afl-replay aflnet-replay afl-showmap afl-tmin afl-gotcpu afl-analyze replay-crashes hnp-replay
 SH_PROGS    = afl-plot afl-cmin afl-whatsup
 
 CFLAGS     ?= -O3 -funroll-loops
@@ -84,6 +84,12 @@ aflnet-replay: aflnet-replay.c $(COMM_HDR) aflnet.o aflnet.h sock2shm_utils.o so
 replay-crashes: replay-crashes.c $(COMM_HDR) aflnet.o aflnet.h sock2shm_utils.o sock2shm_utils.h | test_x86
 	$(CC) $(CFLAGS) $@.c aflnet.o sock2shm_utils.o -o $@ $(LDFLAGS)
 
+# -fcommon: sock2shm_utils.h tentatively defines session_msg; GCC 10+ would
+# emit a strong per-TU definition colliding with sock2shm_utils.o's (same
+# reason the image build passes -fcommon for afl-fuzz).
+hnp-replay: hnp-replay.c $(COMM_HDR) sock2shm_utils.o sock2shm_utils.h | test_x86
+	$(CC) $(CFLAGS) -fcommon $@.c sock2shm_utils.o -o $@ $(LDFLAGS)
+
 afl-showmap: afl-showmap.c $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
 
@@ -96,8 +102,10 @@ afl-analyze: afl-analyze.c $(COMM_HDR) | test_x86
 afl-gotcpu: afl-gotcpu.c $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
 
+# -fcommon: the image build already passes it through CFLAGS for the same
+# sock2shm_utils.h tentative-definition reason; keep host builds working too.
 sock2shm: sock2shm.c sock2shm_utils.o $(COMM_HDR) | test_x86
-	$(CC) $@.c sock2shm_utils.o $(CONTAINER_PATH) -o $@.so $(LDFLAGS_S2S)
+	$(CC) -fcommon $@.c sock2shm_utils.o $(CONTAINER_PATH) -o $@.so $(LDFLAGS_S2S)
 
 ifndef AFL_NO_X86
 
