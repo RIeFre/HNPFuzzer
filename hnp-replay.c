@@ -326,11 +326,12 @@ int main(int argc, char **argv) {
   }
   if (hr_socket >= 0) { close(hr_socket); hr_socket = -1; }
 
-  bool done = false;
-  while (!done) {
+  for (;;) {
     pid_t reaped = waitpid(hr_child, &status, WNOHANG);
-    if (reaped == hr_child) done = true;
-    else if (reaped < 0 && errno != EINTR) hr_fail("waitpid failed");
+    /* A reaped child's own exit status wins even at the deadline; the
+       timeout may only classify an execution that never finished. */
+    if (reaped == hr_child) break;
+    if (reaped < 0 && errno != EINTR) hr_fail("waitpid failed");
     if (hr_interrupted || hr_now_ms() - start >= timeout_ms) {
       hr_timed_out = !hr_interrupted;
       kill(-hr_child, SIGKILL);
@@ -338,10 +339,8 @@ int main(int argc, char **argv) {
       while (waitpid(hr_child, &status, 0) < 0 && errno == EINTR) {}
       break;
     }
-    if (!done) {
-      struct timespec pause = { .tv_nsec = 1000000 };
-      nanosleep(&pause, NULL);
-    }
+    struct timespec pause = { .tv_nsec = 1000000 };
+    nanosleep(&pause, NULL);
   }
   kill(-hr_child, SIGKILL);
   hr_child = -1;

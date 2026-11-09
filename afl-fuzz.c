@@ -3889,13 +3889,39 @@ static void check_map_coverage(void) {
 /* Load the structured replayable twin ([u32 len][payload] per message, as
    written by save_kl_messages_to_file with replay_enabled=1): the exact
    message list and boundaries the campaign delivered. */
-/* The audit runs a previous campaign's queue as -i, so AFL renames every
-   entry to id:NNNNNN,orig:<campaign name>.  The campaign's twins and the
-   collector's depth lookups use the original queue name; recover it. */
-static u8* replay_queue_name(u8* fn) {
+/* A campaign's replayable twins carry the full AFL queue name (e.g.
+   id:000000,orig:dns_queries.raw), and pivot_inputs preserves such names
+   verbatim when the audit re-loads the queue as -i -- so the exact basename
+   is the primary twin lookup.  Only an input whose current name was
+   re-invented (a raw -i seed, no ",orig:" preservation) needs the suffix
+   recovered.  Returns the twin path and sets *twin_name to the name that
+   matched, so depth rows key the way the collector's queue glob sees. */
+static u8* replay_twin_path(u8* fn, u8** twin_name) {
+
+  u8* exact = alloc_printf("%s/%s", replayable_dir, fn);
+  if (!access((char*)exact, F_OK)) {
+
+    *twin_name = fn;
+    return exact;
+
+  }
 
   u8* orig = (u8*)strstr((char*)fn, ",orig:");
-  return orig ? orig + 6 : fn;
+  if (orig) {
+
+    u8* fallback = alloc_printf("%s/%s", replayable_dir, orig + 6);
+    ck_free(exact);
+    if (!access((char*)fallback, F_OK)) {
+
+      *twin_name = orig + 6;
+      return fallback;
+
+    }
+    ck_free(fallback);
+
+  } else ck_free(exact);
+
+  return NULL;
 
 }
 
@@ -3965,12 +3991,15 @@ static void perform_dry_run(char** argv) {
     close(fd);
 
     /* AFLNet construct the kl_messages linked list for this queue entry*/
-    if (replay_only) {
+    u8* twin_name = fn;
 
-      /* The audit must deliver the campaign's own message list -- the one
+    /* The audit must deliver the campaign's own message list -- the one
          the coverage driver replays -- not a parser re-split of the flat
          queue file. */
-      u8* twin = alloc_printf("%s/%s", replayable_dir, replay_queue_name(fn));
+    if (replay_only) {
+
+      u8* twin = replay_twin_path(fn, &twin_name);
+      if (!twin) FATAL("Replay audit twin missing: '%s/%s'", replayable_dir, fn);
       kl_messages = load_kl_messages_from_twin(twin);
       replay_twins_parsed++;
       ck_free(twin);
@@ -3985,10 +4014,9 @@ static void perform_dry_run(char** argv) {
 
     if (depths) {
 
-      u8* audit_name = replay_queue_name(fn);
-      if (strchr((char*)audit_name, '\t') || strchr((char*)audit_name, '\n'))
+      if (strchr((char*)twin_name, '\t') || strchr((char*)twin_name, '\n'))
         FATAL("Replay audit input name cannot contain tabs or newlines");
-      if (fprintf(depths, "%s\t%d\n", audit_name,
+      if (fprintf(depths, "%s\t%d\n", twin_name,
                   replay_depth_seen ? (s32)replay_depth_min : -1) < 0 ||
           fflush(depths))
         PFATAL("Unable to write replay depth evidence");
